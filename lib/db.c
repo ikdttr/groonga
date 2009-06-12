@@ -169,7 +169,6 @@ grn_db_close(grn_ctx *ctx, grn_obj *db)
   grn_db *s = (grn_db *)db;
   if (!s) { return GRN_INVALID_ARGUMENT; }
   GRN_API_ENTER;
-  grn_ctx_qe_fin(ctx);
   GRN_TINY_ARRAY_EACH(&s->values, 1, grn_pat_curr_id(ctx, s->keys), id, vp, {
     if (*vp) { grn_obj_close(ctx, *vp); }
   });
@@ -1994,11 +1993,10 @@ typedef struct {
 } default_set_value_hook_data;
 
 static grn_rc
-default_set_value_hook(grn_ctx *ctx, grn_obj *obj, grn_proc_data *user_data,
-                       int argc, grn_proc_data *argv)
+default_set_value_hook(grn_ctx *ctx, grn_obj *obj, grn_proc_data *user_data)
 {
   grn_proc_ctx *pctx = (grn_proc_ctx *)user_data;
-  if (!pctx || argc != 4) {
+  if (!pctx) {
     ERR(GRN_INVALID_ARGUMENT, "default_set_value_hook failed");
     return GRN_INVALID_ARGUMENT;
   } else {
@@ -2010,6 +2008,7 @@ default_set_value_hook(grn_ctx *ctx, grn_obj *obj, grn_proc_data *user_data,
     default_set_value_hook_data *data = (void *)NEXT_ADDR(h);
     grn_obj *target = grn_ctx_at(ctx, data->target);
     int section = data->section;
+    if (flags) { /* tood */ }
     switch (target->header.type) {
     case GRN_COLUMN_INDEX :
       return grn_ii_column_update(ctx, (grn_ii *)target,
@@ -2793,9 +2792,9 @@ grn_obj_set_value(grn_ctx *ctx, grn_obj *obj, grn_id id,
         while (hooks) {
           pctx.currh = hooks;
           if (hooks->proc) {
-            rc = hooks->proc->funcs[PROC_INIT](ctx, obj, &pctx.user_data, 4, pctx.data);
+            rc = hooks->proc->funcs[PROC_INIT](ctx, obj, &pctx.user_data);
           } else {
-            rc = default_set_value_hook(ctx, obj, &pctx.user_data, 4, pctx.data);
+            rc = default_set_value_hook(ctx, obj, &pctx.user_data);
           }
           if (rc) { goto exit; }
           hooks = hooks->next;
@@ -3636,6 +3635,8 @@ grn_db_obj_init(grn_ctx *ctx, grn_obj *db, grn_id id, grn_db_obj *obj)
 static grn_obj *grn_expr_open(grn_ctx *ctx, grn_obj_spec *spec,
                               const uint8_t *p, const uint8_t *pe);
 
+static grn_obj *grn_expr_dup(grn_ctx *ctx, grn_obj *expr);
+
 grn_obj *
 grn_ctx_at(grn_ctx *ctx, grn_id id)
 {
@@ -3746,6 +3747,14 @@ grn_ctx_at(grn_ctx *ctx, grn_id id)
         }
       }
       res = *vp;
+      if (res->header.type == GRN_EXPR) {
+        if (!grn_hash_add(ctx, ctx->impl->qe, &id, sizeof(grn_id), (void **)&vp, NULL)) {
+          res = NULL;
+        } else {
+          *vp = grn_expr_dup(ctx, res);
+          res = *vp;
+        }
+      }
     }
   }
 exit :
@@ -4473,11 +4482,6 @@ grn_expr_pack(grn_ctx *ctx, grn_obj *buf, grn_obj *expr)
   }
 }
 
-/*
-  uint8_t *p = GRN_BULK_HEAD(buf);
-  uint8_t *pe = p + GRN_BULK_VSIZE(buf);
-*/
-
 const uint8_t *
 grn_expr_unpack(grn_ctx *ctx, const uint8_t *p, const uint8_t *pe, grn_obj *expr)
 {
@@ -4525,6 +4529,7 @@ grn_expr_unpack(grn_ctx *ctx, const uint8_t *p, const uint8_t *pe, grn_obj *expr
       } else {
         APPEND_OBJ(e->consts, e->nconsts, v);
         p = grn_obj_unpack(ctx, p, pe, type, GRN_OBJ_EXPRCONST, v);
+        code->value = v;
       }
       break;
     }
@@ -4639,11 +4644,41 @@ exit :
   GRN_API_RETURN((grn_obj *)expr);
 }
 
+static grn_obj *
+grn_expr_dup(grn_ctx *ctx, grn_obj *expr)
+{
+  grn_expr *e = (grn_expr *)expr;
+  grn_expr *res = (grn_expr *)grn_expr_create(ctx, NULL, 0);
+  if (res) {
+    uint32_t i;
+    grn_expr_code *c, *c0;
+    grn_obj *n0, *v0, *v;
+    res->obj.header.domain = e->obj.id;
+    for (n0 = e->names, v0 = e->vars, i = e->nvars; i; n0++, v0++, i--) {
+      if ((v = grn_expr_add_var(ctx, (grn_obj *)res,
+                                GRN_TEXT_VALUE(n0), GRN_TEXT_LEN(n0)))) {
+        GRN_OBJ_INIT(v, v0->header.type, 0, v0->header.domain);
+        GRN_TEXT_PUT(ctx, v, GRN_TEXT_VALUE(v0), GRN_TEXT_LEN(v0));
+      }
+    }
+    for (c0 = e->codes, c = res->codes, i = e->codes_curr; i; c0++, c++, i--) {
+      off_t g = c0->value - e->vars;
+      c->op = c0->op;
+      c->value = (0 <= g && g < e->nvars) ? res->vars + g : c0->value;
+    }
+    res->codes_curr = e->codes_curr;
+  }
+  return (grn_obj *)res;
+}
+
 grn_rc
 grn_expr_close(grn_ctx *ctx, grn_expr *expr)
 {
   uint32_t i;
   GRN_API_ENTER;
+  if (expr->obj.header.domain) {
+    grn_hash_delete(ctx, ctx->impl->qe, &expr->obj.header.domain, sizeof(grn_id), NULL);
+  }
   for (i = 0; i < expr->nconsts; i++) {
     grn_obj_close(ctx, &expr->consts[i]);
   }
@@ -4902,7 +4937,7 @@ grn_expr_exec(grn_ctx *ctx, grn_obj *expr)
       case GRN_OP_CALL :
         {
           grn_proc *p = (grn_proc *)code->value;
-          p->funcs[PROC_INIT](ctx, NULL, NULL, 0, NULL);
+          p->funcs[PROC_INIT](ctx, NULL, NULL);
         }
         code++;
         break;
